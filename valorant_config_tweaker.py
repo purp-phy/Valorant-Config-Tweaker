@@ -662,6 +662,7 @@ class App(tk.Tk):
 
         self._config_paths: list[Path] = []
         self._native_res: tuple[int, int] = get_native_display_res() or (1920, 1080)
+        self._selected_puuid: str | None = None
 
         self._build()
         self._scan()
@@ -708,25 +709,10 @@ class App(tk.Tk):
                  fg=GREEN if WIN32_AVAILABLE else YELLOW).pack(side="right", pady=(10, 0))
         tk.Frame(self, bg=RED, height=2).pack(fill="x", padx=24, pady=(6, 0))
 
-        # Config file selector
-        self._section_lbl("CONFIG FILE", 12)
-        cf = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-        cf.pack(fill="x", padx=24, pady=(4, 0))
-        self.cfg_var = tk.StringVar(value="Scanning…")
-        self.cfg_combo = ttk.Combobox(cf, textvariable=self.cfg_var,
-                                       state="readonly", font=MONO_F)
-        self.cfg_combo.pack(side="left", fill="x", expand=True, padx=8, pady=7)
-        self.cfg_combo.bind("<<ComboboxSelected>>", lambda _: self._update_native_lbl())
-        tk.Button(cf, text="📂 Open", font=UI_F, bg=CARD, fg=RED,
-                  activebackground=SURFACE, activeforeground=RED, bd=0,
-                  cursor="hand2", command=self._open_folder).pack(side="right", padx=8)
-
         self.native_lbl_var = tk.StringVar(value=f"Native resolution (monitor max): {nw}×{nh}")
-        tk.Label(self, textvariable=self.native_lbl_var, font=("Segoe UI", 8),
-                 bg=BG, fg=MUTED).pack(anchor="w", padx=28, pady=(3, 0))
 
         # Account manager
-        self._section_lbl("ACCOUNTS  (last played highlighted)", 14)
+        self._section_lbl("ACCOUNTS  —  click a row to select  (last played highlighted)", 12)
         acc_outer = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
         acc_outer.pack(fill="x", padx=24, pady=(4, 0))
 
@@ -735,6 +721,11 @@ class App(tk.Tk):
         for txt, w in [("ACCOUNT ID (PUUID)", 28), ("CUSTOM LABEL", 20), ("LAST USED", 10)]:
             tk.Label(acc_hdr, text=txt, font=("Segoe UI Semibold", 7),
                      bg=CARD, fg=MUTED, width=w, anchor="w").pack(side="left")
+        tk.Button(acc_hdr, text="📂 Open folder", font=("Segoe UI", 8), bg=CARD, fg=RED,
+                  activebackground=SURFACE, activeforeground=RED, bd=0,
+                  cursor="hand2", command=self._open_folder).pack(side="right")
+        tk.Label(acc_hdr, textvariable=self.native_lbl_var, font=("Segoe UI", 8),
+                 bg=CARD, fg=MUTED).pack(side="right", padx=(0, 12))
         tk.Frame(acc_outer, bg=BORDER, height=1).pack(fill="x", padx=10, pady=(0, 2))
 
         self._acc_canvas = tk.Canvas(acc_outer, bg=CARD, highlightthickness=0, height=120)
@@ -899,21 +890,22 @@ class App(tk.Tk):
         self.native_lbl_var.set(f"Native resolution (monitor max): {nw}×{nh}")
 
     def _selected(self, silent=False) -> "Path | None":
-        v = self.cfg_var.get()
-        if not v or "No Valorant" in v or "Scanning" in v:
+        if not self._selected_puuid:
             if not silent:
-                messagebox.showerror("No Config", "No config file selected.")
+                messagebox.showerror("No Account", "Click an account row to select it first.")
             return None
-        try:
-            idx = list(self.cfg_combo["values"]).index(v)
-            p   = self._config_paths[idx]
-        except (ValueError, IndexError):
-            p = Path(v)
-        if not p.exists():
-            if not silent:
-                messagebox.showerror("Not Found", f"File not found:\n{p}")
-            return None
-        return p
+        # find config path for selected puuid
+        for acc in get_all_accounts():
+            if acc["puuid"] == self._selected_puuid and acc["config_path"]:
+                p = acc["config_path"]
+                if p.exists():
+                    return p
+                if not silent:
+                    messagebox.showerror("Not Found", f"Config not found:\n{p}")
+                return None
+        if not silent:
+            messagebox.showerror("Not Found", "No config file for selected account.")
+        return None
 
     def _resolve_target_res(self) -> tuple[int, int] | None:
         idx = self.res_var.get()
@@ -935,9 +927,13 @@ class App(tk.Tk):
         return (w, h)
 
     def _open_folder(self):
-        p = self._selected()
+        p = self._selected(silent=True)
         if p:
             subprocess.Popen(["explorer", str(p.parent)], shell=True)
+        elif self._selected_puuid:
+            messagebox.showerror("Not Found", "No config file for selected account.")
+        else:
+            messagebox.showinfo("No Selection", "Click an account row to select it first.")
 
     # ── scan ──────────────────────────────────────────────────────────────────
 
@@ -945,24 +941,10 @@ class App(tk.Tk):
         configs = get_valorant_configs()
         if configs:
             self._config_paths = configs
-
-            def _label(p: Path) -> str:
-                for part in p.parts:
-                    if PUUID_RE.match(part):
-                        return part
-                try:
-                    return str(p.relative_to(VALORANT_CONFIG_BASE))
-                except ValueError:
-                    return str(p)
-
-            labels = [_label(p) for p in configs]
-            self.cfg_combo["values"] = labels
-            self.cfg_var.set(labels[0])
             self._log(f"Found {len(configs)} config file(s).", "info")
             for p in configs:
                 self._log(f"  → {p}", "info")
         else:
-            self.cfg_var.set("No Valorant config found")
             self._config_paths = []
             self._log("⚠  No Valorant config detected.", "warn")
             self._log("  Expected: %LOCALAPPDATA%\\VALORANT\\Saved\\Config\\<PUUID>\\WindowsClient\\GameUserSettings.ini", "warn")
@@ -978,6 +960,12 @@ class App(tk.Tk):
         labels     = _load_labels()
         last_puuid = get_last_played_puuid()
 
+        # auto-select last played on first load if nothing selected yet
+        if self._selected_puuid is None and last_puuid:
+            self._selected_puuid = last_puuid
+        elif self._selected_puuid is None and accounts:
+            self._selected_puuid = accounts[0]["puuid"]
+
         for widget in self._acc_frame.winfo_children():
             widget.destroy()
         self._acc_label_vars.clear()
@@ -992,39 +980,63 @@ class App(tk.Tk):
             return
 
         for acc in accounts:
-            puuid   = acc["puuid"]
-            is_last = (puuid == last_puuid)
-            row_bg  = "#1e1e2e" if is_last else CARD
-            row_fg  = GREEN     if is_last else TEXT
-            status  = read_stretch_status(acc.get("config_path"))
-            label   = labels.get(puuid, "")
+            puuid     = acc["puuid"]
+            is_last   = (puuid == last_puuid)
+            is_sel    = (puuid == self._selected_puuid)
+            row_bg    = "#1e1e2e" if is_last else CARD
+            row_fg    = GREEN     if is_last else TEXT
+            status    = read_stretch_status(acc.get("config_path"))
+            label     = labels.get(puuid, "")
 
-
+            sel_color = RED if is_sel else (BORDER if is_last else row_bg)
             row = tk.Frame(self._acc_frame, bg=row_bg,
-                           highlightbackground=BORDER if is_last else row_bg,
-                           highlightthickness=1)
+                           highlightbackground=sel_color,
+                           highlightthickness=2 if is_sel else 1,
+                           cursor="hand2")
             row.pack(fill="x", padx=4, pady=2)
             self._acc_rows[puuid] = row
 
-            # left accent bar
-            tk.Frame(row, bg=GREEN if is_last else row_bg, width=3).pack(side="left", fill="y")
+            # left accent bar — red if selected, green if last-played, else plain
+            accent_color = RED if is_sel else (GREEN if is_last else row_bg)
+            tk.Frame(row, bg=accent_color, width=4).pack(side="left", fill="y")
 
-            inner = tk.Frame(row, bg=row_bg)
+            inner = tk.Frame(row, bg=row_bg, cursor="hand2")
             inner.pack(side="left", fill="x", expand=True, padx=(6, 6), pady=4)
 
-            # Row 1: PUUID / label  +  LAST PLAYED badge  +  timestamp
-            id_row = tk.Frame(inner, bg=row_bg)
+            # ── click anywhere on row to select ──────────────────────────────
+            def _make_select(p=puuid):
+                def _select(event=None):
+                    self._selected_puuid = p
+                    self._log(f"  ● Selected account: {p[:8]}…", "info")
+                    self.after(0, self._load_accounts)
+                return _select
+            select_fn = _make_select()
+            for widget in (row, inner):
+                widget.bind("<Button-1>", select_fn)
+
+            # Row 1: PUUID / label  +  SELECTED badge  +  LAST PLAYED badge  +  timestamp
+            id_row = tk.Frame(inner, bg=row_bg, cursor="hand2")
             id_row.pack(fill="x")
+            id_row.bind("<Button-1>", select_fn)
 
             if label:
-                tk.Label(id_row, text=label, font=("Segoe UI Semibold", 10),
-                         bg=row_bg, fg=row_fg, anchor="w").pack(side="left")
-                tk.Label(id_row, text=f"  {puuid}", font=MONO_F,
-                         bg=row_bg, fg=MUTED, anchor="w").pack(side="left")
+                l1 = tk.Label(id_row, text=label, font=("Segoe UI Semibold", 10),
+                         bg=row_bg, fg=row_fg, anchor="w", cursor="hand2")
+                l1.pack(side="left")
+                l1.bind("<Button-1>", select_fn)
+                l2 = tk.Label(id_row, text=f"  {puuid}", font=MONO_F,
+                         bg=row_bg, fg=MUTED, anchor="w", cursor="hand2")
+                l2.pack(side="left")
+                l2.bind("<Button-1>", select_fn)
             else:
-                tk.Label(id_row, text=puuid, font=MONO_F,
-                         bg=row_bg, fg=row_fg, anchor="w").pack(side="left")
+                l1 = tk.Label(id_row, text=puuid, font=MONO_F,
+                         bg=row_bg, fg=row_fg, anchor="w", cursor="hand2")
+                l1.pack(side="left")
+                l1.bind("<Button-1>", select_fn)
 
+            if is_sel:
+                tk.Label(id_row, text="● SELECTED", font=("Segoe UI Semibold", 7),
+                         bg=row_bg, fg=RED).pack(side="left", padx=(6, 0))
             if is_last:
                 tk.Label(id_row, text="● LAST PLAYED", font=("Segoe UI Semibold", 7),
                          bg=row_bg, fg=GREEN).pack(side="left", padx=(6, 0))
@@ -1034,8 +1046,9 @@ class App(tk.Tk):
                      bg=row_bg, fg=MUTED).pack(side="right", padx=6)
 
             # Row 2: stretch pill  +  resolution  +  tweaked badge
-            st_row = tk.Frame(inner, bg=row_bg)
+            st_row = tk.Frame(inner, bg=row_bg, cursor="hand2")
             st_row.pack(fill="x", pady=(2, 0))
+            st_row.bind("<Button-1>", select_fn)
 
             if status["stretched"]:
                 pill_bg, pill_fg, pill_txt = GREEN,  "#000", "✔ STRETCHED"
