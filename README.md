@@ -184,5 +184,5 @@ interact with the anti-cheat system (Vanguard). It is not affiliated with or
 endorsed by Riot Games. Use at your own discretion.
 
 ## Don't contact my ahh plz
-Discord: purp.phy
-Telegram: @purpphy
+#### Discord: purp.phy
+#### Telegram: @purpphy
