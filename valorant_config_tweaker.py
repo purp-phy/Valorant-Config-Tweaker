@@ -34,6 +34,13 @@ try:
 except ImportError:
     WIN32_AVAILABLE = False
 
+# ── optional ctypes (always present on Windows, used as win32 fallback) ───────
+try:
+    import ctypes
+    CTYPES_AVAILABLE = True
+except ImportError:
+    CTYPES_AVAILABLE = False
+
 # ──────────────────────────────────────────────────────────────────────────────
 # RESOLUTION PRESETS  — (label, w, h)
 # index 0  = auto-detect native from config
@@ -42,7 +49,7 @@ except ImportError:
 CUSTOM_INDEX = -1   # assigned after list is built
 
 RESOLUTION_PRESETS = [
-    ("Native  (read from config)",   None,  None),
+    ("Native  (from display)",        None,  None),
     ("1024×768   4:3 stretched",     1024,   768),
     ("1280×960   4:3 stretched",     1280,   960),
     ("1280×1024  5:4 stretched",     1280,  1024),
@@ -63,10 +70,29 @@ SHOOTER_SECTION = "[/Script/ShooterGame.ShooterGameUserSettings]"
 # WIN32 DISPLAY HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 def get_current_display_res() -> tuple[int, int]:
-    if not WIN32_AVAILABLE:
-        return (0, 0)
-    dm = win32api.EnumDisplaySettings(None, win32con.ENUM_CURRENT_SETTINGS)
-    return (dm.PelsWidth, dm.PelsHeight)
+    """
+    Returns the primary monitor's native resolution.
+    Tries win32api first, then ctypes (no extra install needed), then (0,0).
+    GetSystemMetrics(0/1) returns the primary monitor dimensions (SM_CXSCREEN /
+    SM_CYSCREEN). SetProcessDPIAware ensures physical pixels on HiDPI displays.
+    """
+    if WIN32_AVAILABLE:
+        try:
+            dm = win32api.EnumDisplaySettings(None, win32con.ENUM_CURRENT_SETTINGS)
+            return (dm.PelsWidth, dm.PelsHeight)
+        except Exception:
+            pass
+    if CTYPES_AVAILABLE:
+        try:
+            user32 = ctypes.windll.user32          # type: ignore[attr-defined]
+            user32.SetProcessDPIAware()
+            w = user32.GetSystemMetrics(0)         # SM_CXSCREEN
+            h = user32.GetSystemMetrics(1)         # SM_CYSCREEN
+            if w > 0 and h > 0:
+                return (w, h)
+        except Exception:
+            pass
+    return (0, 0)
 
 
 def set_display_res(w: int, h: int) -> str:
@@ -105,22 +131,36 @@ def read_ini_key(content: str, key: str) -> str | None:
 
 def parse_native_resolution(path: Path) -> tuple[int, int]:
     """
-    Detect the user's original/native resolution by reading from the backup
-    (if it exists) or the live config, then falling back to the current
-    Windows display resolution, then 1920×1080 as a last resort.
+    Return the user's true native (hardware) resolution.
+
+    Priority order:
+      1. Current Windows display resolution via win32api / ctypes  ← always
+         reflects the physical monitor, not whatever Valorant last wrote.
+      2. Value stored in the backup INI (original pre-tweak config), used only
+         when the display query fails (headless / remote-desktop scenarios).
+      3. Value stored in the live config file.
+      4. 1920×1080 as a last resort.
     """
-    backup = Path(str(path) + BACKUP_SUFFIX)
-    src    = backup if backup.exists() else path
-    try:
-        content = src.read_text(encoding="utf-8", errors="replace")
-        w = read_ini_key(content, "ResolutionSizeX")
-        h = read_ini_key(content, "ResolutionSizeY")
-        if w and h:
-            return (int(w), int(h))
-    except Exception:
-        pass
+    # 1. Ask the OS — most reliable source for *actual* native resolution
     cur = get_current_display_res()
-    return cur if cur != (0, 0) else (1920, 1080)
+    if cur != (0, 0):
+        return cur
+
+    # 2/3. Fall back to the INI files (backup preferred over live config)
+    backup = Path(str(path) + BACKUP_SUFFIX)
+    for src in (backup, path):
+        if not src.exists():
+            continue
+        try:
+            content = src.read_text(encoding="utf-8", errors="replace")
+            w = read_ini_key(content, "ResolutionSizeX")
+            h = read_ini_key(content, "ResolutionSizeY")
+            if w and h:
+                return (int(w), int(h))
+        except Exception:
+            pass
+
+    return (1920, 1080)
 
 
 def _replace_key(content: str, key: str, value: str) -> tuple[str, int]:
@@ -137,6 +177,128 @@ def _insert_before_next_section(content: str, after_section: str,
     next_m = re.search(r"^\[", rest, re.MULTILINE)
     ins    = sec_m.end() + (next_m.start() if next_m else len(rest))
     return content[:ins] + f"{key}={value}\n" + content[ins:]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LAST PLAYED ACCOUNT DETECTION
+# ──────────────────────────────────────────────────────────────────────────────
+# RiotLocalMachine.ini lives at:
+#   %LOCALAPPDATA%\VALORANT\Saved\Config\WindowsClient\RiotLocalMachine.ini
+# It stores the Riot Client's local machine state, including the last logged-in
+# account.  The known key names (Riot has renamed them across versions) are
+# tried in order so the feature keeps working across game updates.
+
+RIOT_LOCAL_MACHINE_INI = (
+    Path(os.environ.get("LOCALAPPDATA", ""))
+    / "VALORANT" / "Saved" / "Config" / "WindowsClient" / "RiotLocalMachine.ini"
+)
+
+# Candidate key names for the display name / Riot ID components.
+# Riot has used several names across client versions — we try all of them.
+_GAMENAME_KEYS = ["GameName", "game_name", "Subject_GameName",
+                  "LastGameName", "riot_id_game_name"]
+_TAGLINE_KEYS  = ["TagLine",  "tag_line",  "Subject_TagLine",
+                  "LastTagLine", "riot_id_tagline"]
+# PUUID — used as a fallback identifier when display name keys are absent
+_PUUID_KEYS    = ["Subject", "puuid", "PUUID", "LastSubject"]
+# Login username (Riot login, not display name) — last-resort label
+_LOGIN_KEYS    = ["Username", "username", "last_username", "RiotUsername"]
+
+
+def _try_keys(content: str, keys: list[str]) -> str | None:
+    """Return the value of the first key found in content, or None."""
+    for key in keys:
+        val = read_ini_key(content, key)
+        if val and val.strip() not in ("", "None", "null"):
+            return val.strip()
+    return None
+
+
+def get_last_played_account() -> dict:
+    """
+    Parse RiotLocalMachine.ini and return a dict with whatever account info
+    can be found.  Keys present in the result:
+      - 'game_name'  : display name  (e.g. "Reyna")
+      - 'tagline'    : tagline        (e.g. "EUW")   — may be absent
+      - 'puuid'      : PUUID string   — may be absent
+      - 'login'      : Riot login name — may be absent
+      - 'source'     : path that was read
+      - 'error'      : set only when something went wrong
+    Also checks the per-account GUID profile folders as a secondary source.
+    """
+    result: dict = {}
+
+    # ── Primary: RiotLocalMachine.ini ────────────────────────────────────────
+    ini = RIOT_LOCAL_MACHINE_INI
+    if ini.exists():
+        try:
+            content = ini.read_text(encoding="utf-8", errors="replace")
+            result["source"] = str(ini)
+            gn = _try_keys(content, _GAMENAME_KEYS)
+            tl = _try_keys(content, _TAGLINE_KEYS)
+            pu = _try_keys(content, _PUUID_KEYS)
+            lo = _try_keys(content, _LOGIN_KEYS)
+            if gn: result["game_name"] = gn
+            if tl: result["tagline"]   = tl
+            if pu: result["puuid"]     = pu
+            if lo: result["login"]     = lo
+        except Exception as ex:
+            result["error"] = str(ex)
+    else:
+        result["error"] = f"File not found: {ini}"
+
+    # ── Secondary: derive display name from GUID folder name ─────────────────
+    # Each account gets its own GUID subfolder under Config.  The most-recently
+    # modified one corresponds to the last-played account.  The folder name is
+    # the PUUID, so if we already have it we can cross-reference; otherwise we
+    # at least surface the PUUID as a fallback identifier.
+    if not result.get("game_name"):
+        config_base = Path(os.environ.get("LOCALAPPDATA", "")) / "VALORANT" / "Saved" / "Config"
+        guid_dirs = sorted(
+            [d for d in config_base.iterdir()
+             if d.is_dir() and re.fullmatch(r"[0-9a-f\-]{36}", d.name)],
+            key=lambda d: d.stat().st_mtime,
+            reverse=True
+        ) if config_base.exists() else []
+        if guid_dirs:
+            latest = guid_dirs[0]
+            if not result.get("puuid"):
+                result["puuid"] = latest.name
+            result.setdefault("source", str(latest))
+            # Try reading a GameUserSettings inside this folder for any name hint
+            gus = latest / "Windows" / "GameUserSettings.ini"
+            if not gus.exists():
+                gus_candidates = list(latest.rglob("GameUserSettings.ini"))
+                gus = gus_candidates[0] if gus_candidates else None
+            if gus and gus.exists():
+                try:
+                    content2 = gus.read_text(encoding="utf-8", errors="replace")
+                    for key in _GAMENAME_KEYS + ["PlayerName", "SavedAccountName"]:
+                        val = read_ini_key(content2, key)
+                        if val and val.strip() not in ("", "None", "null"):
+                            result["game_name"] = val.strip()
+                            break
+                except Exception:
+                    pass
+
+    return result
+
+
+def format_last_account(info: dict) -> str:
+    """Turn the result of get_last_played_account() into a one-line string."""
+    if "error" in info and not any(k in info for k in ("game_name", "puuid", "login")):
+        return f"⚠  {info['error']}"
+    if info.get("game_name"):
+        name = info["game_name"]
+        if info.get("tagline"):
+            name += f"#{info['tagline']}"
+        return name
+    if info.get("login"):
+        return info["login"]
+    if info.get("puuid"):
+        # Show only first 8 chars of PUUID to keep the label tidy
+        return f"PUUID: {info['puuid'][:8]}…"
+    return "Unknown"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -284,14 +446,37 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("VALORANT Config Tweaker")
+
+        # ── Title-bar / decoration fix for Intel iGPU and software-rendered ──
+        # Some systems (Intel HD/UHD, no dedicated GPU, RDP sessions) lose the
+        # native window decorations when heavy theming is applied before the
+        # window manager has finished compositing the frame.  The fixes below
+        # keep the standard OS title bar visible on all configurations:
+        #  • withdraw() / deiconify() defers decoration until Tk is ready.
+        #  • wm_attributes("-toolwindow", False) explicitly re-enables the full
+        #    caption bar (prevents the no-title-bar "tool window" style).
+        #  • update_idletasks() flushes pending geometry before we show the
+        #    window, so the WM sees the correct size and style flags together.
+        self.withdraw()                           # hide until fully built
+        self.wm_attributes("-toolwindow", False)  # ensure full caption bar
+
         self.geometry("720x820")
         self.resizable(False, False)
         self.configure(bg=BG)
         self._icon()
         self._apply_styles()
         self.configs: list[Path] = []
+
+        # Detect native display resolution before building the UI so the
+        # resolution picker can default to "Native" with the real dimensions.
+        native = get_current_display_res()
+        self._native_display_res: tuple[int, int] = native if native != (0, 0) else (1920, 1080)
+
         self._build()
         self._scan()
+
+        self.update_idletasks()                   # flush geometry/style
+        self.deiconify()                          # now show with title bar
 
     def _icon(self):
         try:
@@ -355,6 +540,10 @@ class App(tk.Tk):
         self.res_var = tk.IntVar(value=0)
         self.res_var.trace_add("write", self._on_res_change)
 
+        # Pre-populate custom fields with the real native display resolution so
+        # the user always sees actual hardware dimensions, not config-file values.
+        _nw, _nh = self._native_display_res
+
         left  = tk.Frame(res_card, bg=CARD)
         right = tk.Frame(res_card, bg=CARD)
         left.pack(side="left", fill="both", expand=True, padx=6, pady=6)
@@ -383,7 +572,7 @@ class App(tk.Tk):
         self.custom_rb.pack(side="left")
 
         # Width entry
-        self.custom_w_var = tk.StringVar(value="1280")
+        self.custom_w_var = tk.StringVar(value=str(_nw))
         self.custom_w_entry = tk.Entry(
             custom_row, textvariable=self.custom_w_var,
             width=6, font=MONO_F, bg=SURFACE, fg=TEXT,
@@ -396,7 +585,7 @@ class App(tk.Tk):
                  bg=CARD, fg=MUTED).pack(side="left", padx=4)
 
         # Height entry
-        self.custom_h_var = tk.StringVar(value="960")
+        self.custom_h_var = tk.StringVar(value=str(_nh))
         self.custom_h_entry = tk.Entry(
             custom_row, textvariable=self.custom_h_var,
             width=6, font=MONO_F, bg=SURFACE, fg=TEXT,
@@ -514,19 +703,17 @@ class App(tk.Tk):
             self._log("⚠  Valorant config not detected. Is the game installed?", "warn")
             self._log("  Expected: %LOCALAPPDATA%\\VALORANT\\Saved\\Config\\…\\GameUserSettings.ini", "warn")
 
-        if WIN32_AVAILABLE:
-            cw, ch = get_current_display_res()
-            self._log(f"Current Windows display: {cw}×{ch}", "info")
+        if WIN32_AVAILABLE or CTYPES_AVAILABLE:
+            cw, ch = self._native_display_res
+            self._log(f"Native display resolution: {cw}×{ch}", "info")
         else:
             self._log("⚠  pywin32 not installed — display changes disabled.", "warn")
             self._log("   pip install pywin32", "warn")
 
     def _refresh_native_label(self):
-        p = self._selected(silent=True)
-        if p:
-            nw, nh = parse_native_resolution(p)
-            src = "backup" if Path(str(p) + BACKUP_SUFFIX).exists() else "config"
-            self.native_lbl_var.set(f"Native resolution (from {src}): {nw}×{nh}")
+        # Always show the true hardware resolution queried from the OS.
+        nw, nh = self._native_display_res
+        self.native_lbl_var.set(f"Native resolution (from display): {nw}×{nh}")
 
     # ── path selection ────────────────────────────────────────────────────────
     def _selected(self, silent=False) -> "Path | None":
@@ -564,9 +751,9 @@ class App(tk.Tk):
                 return None
 
         _, w, h = RESOLUTION_PRESETS[idx]
-        if w is None:   # Native auto-detect
-            w, h = parse_native_resolution(path)
-            self._log(f"  ℹ  Auto-detected native: {w}×{h}", "info")
+        if w is None:   # Native auto-detect — use OS display resolution
+            w, h = self._native_display_res
+            self._log(f"  ℹ  Native display resolution: {w}×{h}", "info")
         return (w, h)
 
     def _open_folder(self):
@@ -601,7 +788,7 @@ class App(tk.Tk):
         p = self._selected()
         if not p:
             return
-        nw, nh = parse_native_resolution(p)
+        nw, nh = self._native_display_res
         if not messagebox.askyesno("Reset Config",
                 f"Restore original config from backup?\n\n"
                 f"Display will return to {nw}×{nh}.\n"
