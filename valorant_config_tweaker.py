@@ -1,5 +1,5 @@
 """
-Valorant Config Tweaker v4.0
+Valorant Config Tweaker
 ────────────────────────────────────────────────────────────────────────────────
 • Reads existing GameUserSettings.ini to detect the user's native resolution —
   no hardcoded assumptions about anyone's monitor.
@@ -509,7 +509,7 @@ class App(tk.Tk):
         hdr.pack(fill="x", padx=24, pady=(18, 0))
         tk.Label(hdr, text="VALORANT",        font=HEAD_F, bg=BG, fg=RED ).pack(side="left")
         tk.Label(hdr, text=" CONFIG TWEAKER", font=HEAD_F, bg=BG, fg=TEXT).pack(side="left")
-        tk.Label(hdr, text="v4.0", font=("Segoe UI", 8), bg=BG,
+        tk.Label(hdr, text="", font=("Segoe UI", 8), bg=BG,
                  fg=MUTED).pack(side="left", padx=(6,0), pady=(10,0))
         badge_txt = "win32 ✓" if WIN32_AVAILABLE else "win32 ✗  →  pip install pywin32"
         tk.Label(hdr, text=badge_txt, font=("Segoe UI", 8), bg=BG,
