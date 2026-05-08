@@ -38,7 +38,7 @@ Tkinter ships with Python on Windows. No other dependencies.
 
 ```
 # 1. Clone or download the repo
-git clone https://github.com/yourname/valorant-config-tweaker
+git clone https://github.com/purp-phy/valorant-config-tweaker
 cd valorant-config-tweaker
 
 # 2. Install the one dependency
