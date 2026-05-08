@@ -178,7 +178,7 @@ valorant-config-tweaker/
 ---
 
 ## Disclaimer
-##Don't contact my ahh plz
+## Don't contact my ahh plz
 
 This tool edits a local settings file and changes your Windows display
 resolution. It does **not** inject into the game process, modify game files, or
