@@ -5,6 +5,12 @@ changes your Windows display resolution, and launches Valorant — all in one cl
 
 ---
 
+## Preview
+
+![VALORANT Config Tweaker UI](preview.png)
+
+---
+
 ## Features
 
 | Feature | Details |
